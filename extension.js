@@ -13,17 +13,19 @@ function alignCursors() {
     return;
   }
   
+  const options = textEditor.options;
+  const tab = options.insertSpaces ? 0 : textEditor.options.tabSize;
   // get all the blocks of text that will be aligned from the selections
-  const alignBlocks = createAlignBlocksFromSelections(textEditor.selections);
+  const alignBlocks = createAlignBlocksFromSelections(textEditor.document, tab, textEditor.selections);
   if (alignBlocks.length < 2) {
-    return;
+      return;
   }
-  
-  const targetStartChar = getMaxAlignBlockStartChar(alignBlocks);
-  const targetLength    = getMaxAlignBlockLength   (alignBlocks);
-  
+
+  const targetStartCol = alignBlocks.reduce((prev, i) => Math.max(prev, i.startCol), 0);
+  const targetLength = alignBlocks.reduce((prev, i) => Math.max(prev, i.endCol - i.startCol), 0);
+
   // calculate where we should insert spaces
-  const spaceInserts = createSpaceInsertsFromAlignBlocks(alignBlocks, targetStartChar, targetLength);
+  const spaceInserts = createInsertsFromAlignBlocks(alignBlocks, targetStartCol, targetLength, tab);
   if (spaceInserts.length === 0) {
     return;
   }
@@ -49,11 +51,9 @@ function alignCursors() {
   .then(() => {
     // select all the aligned blocks
     textEditor.selections = alignBlocks.map(alignBlock => {
-      const line      = alignBlock.line;
-      const startChar = targetStartChar;
-      const endChar   = targetStartChar + targetLength;
-      
-      return new vscode.Selection(line, startChar, line, endChar);
+      const start = columnToPosition(textEditor.document, tab, alignBlock.line, targetStartCol);
+      const end = columnToPosition(textEditor.document, tab, alignBlock.line, targetStartCol + targetLength);
+      return new vscode.Selection(start.line, start.character, end.line, end.character);
     });
     
     textEditor.edit(textEditorEdit => {
@@ -77,7 +77,34 @@ module.exports = {
   alignCursors
 };
 
-
+function positionToColumn(doc, tab, pos) {
+  const lineText = doc.lineAt(pos.line).text;
+  let col = 0;
+  for (let i = 0; i < pos.character; i++) {
+      const codePoint = lineText.codePointAt(i);
+      if (typeof codePoint !== 'undefined') {
+          if (codePoint > 0xffff) {
+              ++i;
+          }
+          col += codePoint === 9 ? tab - (col % tab) : 1;
+      }
+  }
+  return col;
+}
+function columnToPosition(doc, tab, line, col) {
+  const lineText = doc.lineAt(line).text;
+  let i = 0;
+  for (let currentCol = 0; currentCol < col && i < lineText.length; i++) {
+      const codePoint = lineText.codePointAt(i);
+      if (typeof codePoint !== 'undefined') {
+          if (codePoint > 0xffff) {
+              ++i;
+          }
+          currentCol += codePoint === 9 ? tab - (currentCol % tab) : 1;
+      }
+  }
+  return new vscode.Position(line, i);
+}
 
 
 /**
@@ -86,42 +113,25 @@ module.exports = {
  * @param {vscode-Selection} selections Selections to create align blocks from.
  * @returns Align blocks.
  */
-function createAlignBlocksFromSelections(selections) {
+function createAlignBlocksFromSelections(doc, tab, selections) {
   const alignBlocks = [];
-  
   // create align blocks for each selection
-  for (let i = 0; i < selections.length; ++i) {
-    const selection = selections[i];
-    
-    if (selection.isSingleLine) {
-      // create one block for single-line selections
-      alignBlocks.push(createAlignBlock(selection.start.line, selection.start.character, selection.end.character));
-    }
-    else {
-      // create two blocks 0-length blocks at the start and end for multi-line selections
-      alignBlocks.push(createAlignBlock(selection.start.line, selection.start.character, selection.start.character));
-      alignBlocks.push(createAlignBlock(selection.end  .line, selection.end  .character, selection.end  .character));
-    }
-  }
-  
-  // combine align blocks that are on the same line
-  for (let i = 1; i < alignBlocks.length; ++i) {
-    for (let j = 0; j < i; ++j) {
-      // check if two blocks are on the same line
-      if (alignBlocks[j].line !== alignBlocks[i].line) {
-        continue;
+  for (const i of selections) {
+      if (i.isSingleLine) {
+          // create one block for single-line selections
+          alignBlocks.push(createAlignBlock(doc, tab, i.start, i.end));
       }
-      
-      // combine the blocks by using the min start char and the max end char
-      alignBlocks[j].startChar = Math.min(alignBlocks[j].startChar, alignBlocks[i].startChar);
-      alignBlocks[j].endChar   = Math.max(alignBlocks[j].endChar,   alignBlocks[i].endChar  );
-      
-      alignBlocks.splice(i, 1);
-      --i;
-      break;
-    }
+      else {
+          // create two blocks 0-length blocks at the start and end for multi-line selections
+          alignBlocks.push(createAlignBlock(doc, tab, i.start, i.start));
+          alignBlocks.push(createAlignBlock(doc, tab, i.end, i.end));
+      }
   }
-  
+  alignBlocks.reduce((prev, i) => {
+      const j = prev[i.line];
+      prev[i.line] = j ? combineAlignBlocks(j, i) : i;
+      return prev;
+  }, {});
   return alignBlocks;
 }
 
@@ -132,55 +142,24 @@ function createAlignBlocksFromSelections(selections) {
  * @param {number} endChar Ending character of the align block.
  * @returns Align block.
  */
-function createAlignBlock(line, startChar, endChar) {
+function createAlignBlock(doc, tab, start, end) {
   return {
-    line,
-    startChar,
-    endChar
+    line: start.line,
+    startChar: start.character,
+    endChar: end.character,
+    startCol: positionToColumn(doc, tab, start),
+    endCol: positionToColumn(doc, tab, end),
   };
 }
-
-/**
- * Gets the right-most starting character of the given align blocks.
- * @param {Object[]} alignBlocks
- * @returns {number} Right-most (max) starting character.
- */
-function getMaxAlignBlockStartChar(alignBlocks) {
-  let maxBlockStartChar = -1;
-  
-  for (let i = 0; i < alignBlocks.length; ++i) {
-    const alignBlock = alignBlocks[i];
-    
-    if (alignBlock.startChar > maxBlockStartChar) {
-      maxBlockStartChar = alignBlock.startChar;
-    }
-  }
-  
-  return maxBlockStartChar;
+function combineAlignBlocks(a, b) {
+  return {
+    line: a.line,
+    startChar: Math.min(a.startChar, b.startChar),
+    endChar: Math.max(a.endChar, b.endChar),
+    startCol: Math.min(a.startCol, b.startCol),
+    endCol: Math.max(a.endCol, b.endCol),
+  };
 }
-
-/**
- * Gets the longest length of the given align blocks.
- * @param {Object[]} alignBlocks
- * @returns {number} Longest (max) length.
- */
-function getMaxAlignBlockLength(alignBlocks) {
-  let maxBlockLength = -1;
-  
-  for (let i = 0; i < alignBlocks.length; ++i) {
-    const alignBlock = alignBlocks[i];
-    const blockLength = alignBlock.endChar - alignBlock.startChar;
-    
-    if (blockLength > maxBlockLength) {
-      maxBlockLength = blockLength;
-    }
-  }
-  
-  return maxBlockLength;
-}
-
-
-
 
 /**
  * Creates space inserts to align the given align blocks. Space Inserts
@@ -189,27 +168,22 @@ function getMaxAlignBlockLength(alignBlocks) {
  * @param {number}   targetStartChar Starting character to align the blocks to.
  * @param {number}   targetLength    Length to align the blocks to.
  */
-function createSpaceInsertsFromAlignBlocks(alignBlocks, targetStartChar, targetLength) {
+function createInsertsFromAlignBlocks(alignBlocks, targetStartCol, targetLength, tab) {
   const spaceInserts = [];
-  
   // create space inserts for each align block
-  for (let i = 0; i < alignBlocks.length; ++i) {
-    const alignBlock = alignBlocks[i];
-    const alignBlockLength = alignBlock.endChar - alignBlock.startChar;
-    
-    const startDist = targetStartChar - alignBlock.startChar;
-    const endDist   = targetLength    - alignBlockLength;
-    
+  for (const i of alignBlocks) {
+    const alignBlockLength = i.endCol - i.startCol;
+    const startDist = targetStartCol - i.startCol;
+    const endDist = targetLength - alignBlockLength;
     if (startDist > 0) {
       // insert spaces before the align block to align the left side
-      spaceInserts.push(createSpaceInsert(alignBlock.line, alignBlock.startChar, startDist));
+      spaceInserts.push(createSpaceInsert(i.line, i.startChar, i.startCol, startDist, tab));
     }
     if (endDist > 0) {
       // insert spaces after the align block to align the right side
-      spaceInserts.push(createSpaceInsert(alignBlock.line, alignBlock.endChar, endDist));
+      spaceInserts.push(createSpaceInsert(i.line, i.endChar, i.endCol, endDist, tab));
     }
   }
-  
   return spaceInserts;
 }
 
@@ -220,9 +194,20 @@ function createSpaceInsertsFromAlignBlocks(alignBlocks, targetStartChar, targetL
  * @param {number} dist      Number of spaces to insert.
  * @returns Space insert.
  */
-function createSpaceInsert(line, startChar, dist) {
-  return {
-    pos: new vscode.Position(line, startChar),
-    str: ' '.repeat(dist)
-  };
+function createSpaceInsert(line, startChar, startCol, dist, tab) {
+  if (tab) {
+    const endCol = startCol + dist;
+    const firstTab = Math.floor((startCol + tab - 1) / tab);
+    const lastTab = Math.floor(endCol / tab);
+    return {
+      pos: new vscode.Position(line, startChar),
+      str: ' '.repeat(firstTab * tab - startCol) + '\t'.repeat(lastTab - firstTab) + ' '.repeat(endCol - lastTab * tab)
+    };
+  }
+  else {
+    return {
+      pos: new vscode.Position(line, startChar),
+      str: ' '.repeat(dist)
+    };
+  }
 }
